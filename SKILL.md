@@ -111,7 +111,10 @@ print('compaction.mode:', defaults.get('compaction',{}).get('mode','未配置'))
 # Daily-memory 检查
 ls -lt ~/.openclaw/workspace/memory/ 2>/dev/null | head -5
 
-# Daily-memory 双保险检查（hooks + AGENTS.md 提示词）
+# Daily-memory 关键检查（AGENTS.md 提示词为主，hooks 仅手动 reset 兜底）
+# 注意：hooks.internal.entries.session-memory 只在用户手动 /new 或 /reset 时触发，
+# daily/idle 自动 reset 不会触发它（GitHub issue #43524/#45608/#50891）。
+# 所以 daily-memory 实际生成主要靠 AGENTS.md 提示词驱动 agent 自己 write。
 python3 -c "
 import json
 d=json.load(open('$HOME/.openclaw/openclaw.json'))
@@ -152,10 +155,15 @@ wc -c ~/.openclaw/workspace/SYSTEM.md 2>/dev/null || echo "SYSTEM.md: 不存在"
 |------|------|---------|--------|---------|--------|------|
 | xxx  | 运行中/离线 | N行 | N条 | N人 | N条 | 异常说明 |
 
-### Daily-Memory 状态（双保险）
-| 实例 | 今日 daily-memory | hooks session-memory | AGENTS.md 指令 | 状态 |
-|------|-------------------|---------------------|---------------|------|
-| xxx  | 有/无             | ✅/❌              | ✅/❌          | 双保险/单保险/无保险 |
+### Daily-Memory 状态
+| 实例 | 今日 daily-memory | 当日消息量 | AGENTS.md 指令 | hooks session-memory（兜底） | 备注 |
+|------|-------------------|-----------|---------------|---------------------------|------|
+| xxx  | 有/无             | N 条 / N 用户 | ✅/❌      | ✅/❌                      | 说明 |
+
+> ⚠️ daily-memory 主要靠 AGENTS.md 提示词驱动 agent 自己 write。`session-memory` hook 只在手动 `/new` 或 `/reset` 时触发，daily/idle 自动 reset 不调用它（OpenClaw 已知 limitation，GitHub issue #43524/#45608/#50891）。
+> 因此判断"daily-memory 缺失"是否为问题，要先看当日消息量：
+> - 0 消息或仅简单问答 = 不写正常，不要标为故障
+> - 有大量任务型消息但仍无 daily-memory = 才值得排查 AGENTS.md 指令是否生效
 
 ### 配置完整性
 | 实例 | dmScope | session.reset | contextTokens | fallbacks | cron 错误 | rate_limit | 需关注 |
@@ -417,22 +425,28 @@ wc -c ~/.openclaw/workspace/CLAUDE.md 2>/dev/null || echo "CLAUDE.md: missing"
 
 ### 阶段 6：Daily-Memory 与 Cron 健康检查
 
-#### Daily-Memory 生成机制（双保险）
+#### Daily-Memory 生成机制（订正：实际只有一种）
 
-Daily-memory 有两种独立的生成机制，建议全部启用：
+> ⚠️ 早期版本说"双保险"，**已订正为错误**。OpenClaw 文档与 GitHub issue #43524 / #45608 / #50891 确认：`hooks.internal.entries.session-memory` **只在用户手动 `/new` 或 `/reset` 时触发**，daily reset（凌晨 atHour）和 idle reset 都不会调用它。截至 2026-05 仍是 open feature request，未修复。
 
-1. **hooks 机制（自动）**：`hooks.internal.entries.session-memory.enabled: true`
-   - 触发时机：session reset（凌晨 `session.reset.atHour` 点）时自动触发
-   - 由 gateway 内置 hook 自动将当天 session 摘要写入 `memory/YYYY-MM-DD.md`
-   - 依赖条件：`session.reset.mode: daily` + hook 启用
+Daily-memory 的**实际生成机制只有一种**：
 
-2. **AGENTS.md 提示词驱动（agent 自主行为）**：
-   - AGENTS.md 中有 memory 指令，agent 在对话中主动调用 `write` 工具写入 daily-memory
-   - 不依赖任何 hooks 配置，但需要有实际对话活动
-   - 可在日志中看到 `tool call: write params={"file_path":"...memory/YYYY-MM-DD.md"...}`
+**AGENTS.md 提示词驱动（agent 自主行为）**
+- AGENTS.md 中有 memory 指令，agent 在对话中主动调用 `write` 工具写入 daily-memory
+- 不依赖任何 hooks 配置，但需要有**实际对话活动**且 agent 判断"值得记录"
+- 可在日志中看到 `tool call: write params={"file_path":"...memory/YYYY-MM-DD.md"...}`
 
-两种机制互相补充：hooks 保证每天 reset 时一定写入摘要；提示词驱动让 agent 在对话过程中更及时地记录。
-如果只有一种机制，应在巡检报告中标记为"缺少双保险"并建议补全。
+**hooks 兜底机制**（不是日常主力）
+- `hooks.internal.entries.session-memory.enabled: true` 只在手动 reset 时执行
+- 实际用户极少手动 reset，所以这个 hook 大多数日子不触发
+- 仍建议启用，作为手动 reset 时的兜底
+
+#### 巡检判断要点（重要）
+
+**不要再因为"今日 daily-memory 缺失"自动标记问题**。先看当天消息活跃度：
+- **0 消息或仅简单问答** → agent 没机会/没必要写，**这是预期行为，不是故障**
+- **大量任务型消息（文件归档、研报、代码）+ 仍无 daily-memory** → 才值得排查 AGENTS.md 指令是否生效
+- **配置完全相同的两台机器**（hooks + AGENTS.md 都 ✅），daily-memory 出现差异 → 几乎一定是使用模式差异，不是配置 bug
 
 #### 检查命令
 
@@ -446,7 +460,7 @@ cat ~/.openclaw/workspace/memory/<today-date>.md 2>/dev/null | head -30
 # MEMORY.md（长期记忆）
 cat ~/.openclaw/workspace/MEMORY.md 2>/dev/null | head -30
 
-# hooks 配置检查（双保险检查）
+# hooks 配置检查（仅作为兜底机制看一下，daily-memory 不靠这个）
 python3 -c "
 import json
 d=json.load(open('$HOME/.openclaw/openclaw.json'))
@@ -473,7 +487,9 @@ grep "<today-date>" ~/.openclaw/logs/gateway.log | grep "cron.*Channel is requir
 检查项：
 - daily-memory 是否有今日记录（workspace/memory/<today-date>.md 文件是否存在且非空）
 - daily-memory 是否连续（检查最近几天的文件）
-- **双保险检查**：hooks session-memory 是否启用 + AGENTS.md 是否有 memory 指令，两者都应该有
+- **缺失时先看消息活跃度**：0 消息那天 daily-memory 缺失是正常的；只有高活跃度但仍缺失才值得排查
+- AGENTS.md 是否包含 memory 指令（这才是 daily-memory 的实际驱动）
+- hooks session-memory 是否启用（兜底机制，不要因此判定双保险）
 - Cron 任务是否有 "Channel is required" 错误（说明定时任务缺少 delivery 配置）
 - MEMORY.md 是否已建立（长期记忆索引）
 
@@ -523,9 +539,11 @@ print('done')
 "
 ```
 
-### 修复：Daily-Memory 双保险缺失（hooks 未配置）
+### 修复：补充 session-memory hooks（手动 reset 兜底）
 
-当巡检发现 `hooks.internal.entries.session-memory` 未启用时，补上完整的 hooks 配置：
+注意：这个 hook **不影响日常 daily-memory 生成**（daily-memory 靠 AGENTS.md 指令驱动 agent 自己 write）。它只在用户手动 `/new` 或 `/reset` 时触发，作为兜底保存当时的 session 摘要。仍建议启用。
+
+当 `hooks.internal.entries.session-memory` 未启用时，补上完整的 hooks 配置：
 
 ```bash
 python3 -c "
