@@ -196,12 +196,13 @@ wc -c ~/.openclaw/workspace/SYSTEM.md 2>/dev/null || echo "SYSTEM.md: 不存在"
 ### 阶段 1：连通性检查
 
 逐项执行：
-- `ping -c 3 -W 2 <ip>` — 网络可达性
-- `nc -z -w 2 <ip> 22` — SSH 端口
-- `nc -z -w 2 <ip> 18789` — Gateway 端口（默认）
+- `ping -c 3 -W 2 <ip>` — 网络可达性辅助信号（部分机器禁 ICMP，不作为终止条件）
+- `nc -z -w 2 <ip> 22` — SSH 端口辅助检查
+- 使用“连接准备”中的 `sshpass` 命令执行 `echo OK` — SSH 真实登录检查，失败时至少重试 2 次（共 3 次）
+- SSH 登录成功后再检查 `nc -z -w 2 127.0.0.1 18789` 或 `openclaw gateway status` — Gateway 状态
 
-如果 ping 不通，诊断终止，告知用户机器不可达。
-如果 SSH 端口不通，诊断终止，告知用户 SSH 服务异常。
+如果 ping 不通但 SSH 登录成功，继续诊断，不要判定机器离线。
+如果 SSH 真实登录连续 3 次失败，诊断终止，告知用户 SSH 不可达或凭据异常，并附上失败摘要。
 
 注意：Gateway 端口可能绑定在 localhost（127.0.0.1），此时远程 nc 检测会失败但 gateway 实际在运行。
 不要因为 Gateway 端口不通就判定服务异常，需要 SSH 登录后进一步确认。
@@ -882,7 +883,7 @@ print('done')
 
 注意：这个 hook **不影响日常 daily-memory 生成**（daily-memory 靠 AGENTS.md 指令驱动 agent 自己 write）。它只在用户手动 `/new` 或 `/reset` 时触发，作为兜底保存当时的 session 摘要。仍建议启用。
 
-当 `hooks.internal.entries.session-memory` 未启用时，补上完整的 hooks 配置：
+当 `hooks.internal.entries.session-memory` 未启用时，合并补上 hooks 配置。必须保留已有自定义 hook，不要覆盖整个 `hooks` 字段：
 
 ```bash
 python3 -c "
@@ -890,16 +891,13 @@ import json
 path = '$HOME/.openclaw/openclaw.json'
 with open(path) as f:
     config = json.load(f)
-config['hooks'] = {
-    'internal': {
-        'enabled': True,
-        'entries': {
-            'boot-md': {'enabled': True},
-            'command-logger': {'enabled': True},
-            'session-memory': {'enabled': True}
-        }
-    }
-}
+hooks = config.setdefault('hooks', {})
+internal = hooks.setdefault('internal', {})
+internal['enabled'] = True
+entries = internal.setdefault('entries', {})
+for name in ['boot-md', 'command-logger', 'session-memory']:
+    entry = entries.setdefault(name, {})
+    entry['enabled'] = True
 with open(path, 'w') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 print('done')
@@ -907,8 +905,6 @@ print('done')
 ```
 
 修改后需要重启 gateway。重启后日志应显示 `[hooks] loaded 4 internal hook handlers`。
-
-注意：如果已有 `hooks` 配置（如自定义 hook），应合并而非覆盖。上面的脚本会覆盖整个 `hooks` 字段。
 
 ### 修复：Session dmScope 未配置
 
@@ -1005,18 +1001,16 @@ npm install -g openclaw@latest
 升级后需要重启 gateway。
 **注意**：升级过程中 gateway 会因为 dist 文件缺失而无法启动，等 npm 完成后再重启。
 
-**升级后 feishu 配置兼容性问题**（2026.4.14+ 确认）：
+**升级后 feishu 配置兼容性问题**：
 
-新版本收紧了 `channels.feishu` 的 JSON Schema，以下字段不再被接受，会导致 gateway 启动失败并报
-`channels.feishu: invalid config: must NOT have additional properties`：
+先以当前版本的官方 Feishu 文档和 `openclaw doctor` 输出为准。官方文档中 `groupPolicy`、`requireMention`、`groups`、`groupAllowFrom` 是有效字段；不要把这些访问控制字段当作 legacy 字段删除。
 
-- `streaming`
+如果 gateway 启动失败并报 `channels.feishu: invalid config: must NOT have additional properties`，只删除报错中明确点名的未知字段。历史上常见的 legacy 字段包括：
+
 - `footer`（含 `footer.elapsed`、`footer.status`）
-- `groupPolicy`
-- `requireMention`
 - `mediaLocalRoots`
 
-**升级后必须检查并删除这些字段**，否则 gateway 无法启动。修复脚本：
+检查脚本：
 ```bash
 python3 -c "
 import json
@@ -1025,7 +1019,7 @@ with open(path) as f:
     config = json.load(f)
 ch = config.get('channels',{}).get('feishu',{})
 removed = []
-for k in ['footer','streaming','groupPolicy','requireMention','mediaLocalRoots']:
+for k in ['footer','mediaLocalRoots']:
     if k in ch:
         del ch[k]
         removed.append(k)
@@ -1042,9 +1036,9 @@ else:
 
 **从 openclaw-lark 切换到内置 feishu 时的群聊策略问题**：
 
-内置 feishu 插件默认 `groupPolicy=allowlist`，如果之前用 openclaw-lark 时群聊是 open 模式，切换后群消息会被全部拦截（日志显示 `group xxx not in groupAllowFrom (groupPolicy=allowlist)`），DM 私聊不受影响。
+内置 feishu 默认 `groupPolicy=allowlist`，如果之前用 openclaw-lark 时群聊是 open 模式，切换后群消息可能会被拦截（日志显示 `group xxx not in groupAllowFrom (groupPolicy=allowlist)`），DM 私聊不受影响。
 
-切换插件后必须确认群聊策略：
+切换插件后必须确认群聊策略。若需要允许所有群，并保持必须 @ 机器人：
 ```bash
 python3 -c "
 import json
@@ -1053,12 +1047,14 @@ with open(path) as f:
     config = json.load(f)
 ch = config['channels']['feishu']
 ch['groupPolicy'] = 'open'
-ch['requireMention'] = False
+ch['requireMention'] = True
 with open(path, 'w') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 print('done')
 "
 ```
+
+如果只允许指定群，使用 `groupPolicy: allowlist` 并配置 `groupAllowFrom: ['oc_xxx']`。如需某个群不要求 @，配置 `channels.feishu.groups.<chat_id>.requireMention = false`，不要全局关闭 @ 要求。
 
 **npm 权限问题**：部分机器可能报 `EACCES` 错误（npm cache 含 root-owned 文件），需先修复：
 ```bash

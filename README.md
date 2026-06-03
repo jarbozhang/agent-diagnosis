@@ -7,7 +7,7 @@
 - **单机深度诊断** — 6 阶段检查：连通性、服务状态、错误日志分析、模型/授权、频道/会话配置、Daily-Memory 与 Cron 健康
 - **批量巡检** — 一条命令检查所有托管实例，输出结构化巡检报告
 - **自动修复** — 自动修复常见问题：Session 膨胀、配置缺失、陈旧锁文件、工具冲突、版本升级等
-- **Daily-Memory 双保险审计** — 同时验证 Hook 驱动和提示词驱动两种记忆生成机制
+- **Daily-Memory 审计** — 验证 AGENTS.md 提示词驱动的日常记忆生成，并检查 session-memory hook 是否作为手动 reset 兜底启用
 
 ## 托管实例
 
@@ -23,7 +23,7 @@
 
 ## 诊断阶段
 
-1. **连通性检查** — ping、SSH 端口、Gateway 端口
+1. **连通性检查** — SSH 重试、SSH 端口、Gateway 端口（ping 仅作辅助信号）
 2. **服务状态** — 版本、Gateway 进程、launchctl 状态
 3. **错误日志分析** — 匹配 20+ 已知错误模式，按严重程度分级
 4. **模型与授权** — API Key 有效性、OAuth Token 过期检测
@@ -36,7 +36,7 @@
 |------|-----------|
 | Session 文件膨胀（>2MB） | 是 |
 | 缺少 contextTokens 配置 | 是 |
-| Daily-Memory Hook 未启用 | 是 |
+| session-memory hook 未启用（手动 reset 兜底） | 是 |
 | Session dmScope 未设置 | 是 |
 | tools.allow / alsoAllow 冲突 | 是 |
 | 飞书工具名不匹配 | 是 |
