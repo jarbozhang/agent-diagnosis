@@ -3,6 +3,8 @@ name: openclaw-diagnosis
 description: |
   诊断和修复远程 OpenClaw 实例的问题。当用户提到"诊断openclaw"、"openclaw问题"、
   "openclaw挂了"、"openclaw不响应"、"openclaw状态"、"检查openclaw"时触发此技能。
+  也适用于诊断远程 Hermes Agent / Hermes gateway 问题，例如"hermes挂了"、"hermes不回"、
+  "hermes模型连不上"、"微信 hermes 没回复"、"检查 hermes 状态"。
   也适用于用户提到特定机器名（zhangjiabo、yuchao、zhangyang、danni、liucongying、刘聪颖）并涉及服务问题时触发。
   即使用户只是随口说"openclaw怎么了"或"看看XX的openclaw"也应该触发。
   当用户说"巡检"、"巡检所有机器"、"检查使用情况"时，进入批量巡检模式。
@@ -11,12 +13,13 @@ description: |
 
 # OpenClaw 远程诊断与修复
 
-通过 SSH 连接远程 OpenClaw 实例，执行标准化诊断流程，自动识别并修复常见问题，
+通过 SSH 连接远程 OpenClaw / Hermes 实例，执行标准化诊断流程，自动识别并修复常见问题，
 最终输出完整的诊断报告和修复记录。
 
 支持两种模式：
 - **单机诊断**：深度诊断指定实例的问题
 - **批量巡检**：快速检查所有实例的健康状态和使用情况
+- **Hermes 诊断**：按官方 `status` / `doctor` / `gateway` / `logs` / provider / fallback 检查模型和消息通道
 
 ## 已知实例
 
@@ -50,8 +53,10 @@ sshpass -p '<password>' ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o 
 - **SSH/ping 超时必须重试**：Tailscale 网络偶尔抖动，单次 SSH 超时不代表机器不可达。任何 SSH 连接失败（包括 ConnectTimeout、Operation timed out）都必须至少重试 2 次再判定为离线。连通性预检和数据采集阶段都适用此规则。
 - PATH 可能不含 homebrew，远程命令中始终前置：
 ```bash
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.hermes/hermes-agent/venv/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 ```
+
+如果只诊断 OpenClaw，Hermes venv 路径不存在也不影响；如果目标机器装了 Hermes，这能确保 `hermes` CLI 可用。
 
 ## 批量巡检模式
 
@@ -492,6 +497,340 @@ grep "<today-date>" ~/.openclaw/logs/gateway.log | grep "cron.*Channel is requir
 - hooks session-memory 是否启用（兜底机制，不要因此判定双保险）
 - Cron 任务是否有 "Channel is required" 错误（说明定时任务缺少 delivery 配置）
 - MEMORY.md 是否已建立（长期记忆索引）
+
+## Hermes Agent 诊断流程
+
+当用户明确提到 Hermes、Hermes gateway、微信 Hermes 不回、模型连不上，或目标机器同时运行 Hermes 时，优先执行本流程。Hermes 的官方诊断入口是 `hermes status`、`hermes doctor`、`hermes gateway status`、`hermes logs`、`hermes config`、`hermes auth`、`hermes sessions`、`hermes cron`。
+
+### Hermes 阶段 1：基础连通性和服务状态
+
+SSH 登录后先确认 Hermes CLI、版本、gateway 进程和服务管理方式：
+
+```bash
+export PATH="$HOME/.hermes/hermes-agent/venv/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+echo "===HERMES_VERSION==="
+hermes --version 2>&1 || ~/.hermes/hermes-agent/venv/bin/hermes --version 2>&1 || true
+
+echo "===HERMES_STATUS==="
+hermes status --all 2>&1 || hermes status 2>&1 || true
+
+echo "===HERMES_DOCTOR==="
+hermes doctor 2>&1 || true
+
+echo "===HERMES_GATEWAY_STATUS==="
+hermes gateway status 2>&1 || true
+
+echo "===PROCESSES==="
+ps aux | grep -i hermes | grep -v grep
+
+echo "===LAUNCHCTL==="
+launchctl list 2>/dev/null | grep -i hermes || true
+
+echo "===LISTEN_PORTS==="
+lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i hermes || true
+```
+
+关注点：
+- `hermes status` 中 Model、Provider、API Keys、Auth Providers、Messaging Platforms、Gateway Service、Sessions 是否正常
+- `hermes doctor` 中 Python 环境、依赖、配置版本、auth、外部工具、tool availability、skills、memory 是否有 fatal 问题
+- gateway 是否由 launchd/systemd 管理，PID 是否存在，是否反复重启
+- `hermes` 不在 PATH 时，直接用 `~/.hermes/hermes-agent/venv/bin/hermes`
+
+### Hermes 阶段 2：Gateway 与消息平台日志
+
+官方 FAQ 的最小恢复检查是：
+
+```bash
+hermes gateway status
+hermes gateway start
+cat ~/.hermes/logs/gateway.log | tail -50
+```
+
+诊断时采集更完整的日志：
+
+```bash
+TODAY=$(date +%F)
+
+echo "===GATEWAY_LOG_TAIL==="
+tail -120 ~/.hermes/logs/gateway.log 2>/dev/null || true
+
+echo "===GATEWAY_ERROR_TAIL==="
+tail -160 ~/.hermes/logs/gateway.error.log 2>/dev/null || true
+
+echo "===ERRORS_TAIL==="
+tail -160 ~/.hermes/logs/errors.log 2>/dev/null || true
+
+echo "===AGENT_LOG_ERRORS_TODAY==="
+grep "$TODAY" ~/.hermes/logs/agent.log 2>/dev/null | grep -Ei "error|failed|timeout|exception|traceback|model|provider|openai|api|rate|quota|fallback|connect|unauthorized|forbidden|401|403|429|500|502|503|504" | tail -120 || true
+
+echo "===GATEWAY_ERRORS_TODAY==="
+grep "$TODAY" ~/.hermes/logs/gateway.log 2>/dev/null | grep -Ei "error|failed|timeout|exception|traceback|rate limited|send failed|unauthorized|No messaging|inbound|response ready" | tail -160 || true
+```
+
+消息平台判断：
+- 有 `inbound message` 但无 `conversation turn`：gateway 收到消息，但没有进入 agent，检查 allowlist / pairing / platform policy
+- 有 `conversation turn` 但大量 `APITimeoutError`：模型 provider 或上游账号池问题
+- 有 `response ready` 但用户没收到：检查 `send failed`、`rate limited`、平台 token、通道限流
+- `Unauthorized user`：用户未配对或 allowlist 不允许
+- `No messaging platforms enabled`：gateway 没启用任何消息平台或环境变量缺失
+
+### Hermes 阶段 3：模型、Provider、Auth 与 Fallback
+
+先用官方命令看配置和授权，不要输出密钥原文：
+
+```bash
+echo "===MODEL_CONFIG==="
+hermes config 2>&1 | sed -E 's/(api_key|token|secret|password|Authorization):.*/\1: <redacted>/Ig' || true
+
+echo "===AUTH_LIST==="
+hermes auth list 2>&1 | sed -E 's/(api_key|token|secret|password|Authorization):.*/\1: <redacted>/Ig' || true
+
+echo "===FALLBACK_LIST==="
+hermes fallback list 2>&1 || hermes fallback 2>&1 || true
+```
+
+如果 `hermes model` 需要交互式终端，不要在非交互 SSH 管道中执行；改为读取 `~/.hermes/config.yaml` 的安全摘要：
+
+```bash
+python3 - <<'PY'
+import os, re, json
+try:
+    import yaml
+except Exception as e:
+    print("yaml_import_error", repr(e)); raise SystemExit
+
+path = os.path.expanduser("~/.hermes/config.yaml")
+try:
+    config = yaml.safe_load(open(path)) or {}
+except Exception as e:
+    print("config_parse_error", repr(e)); raise SystemExit
+
+secret_re = re.compile(r"(key|token|secret|password|credential|auth|cookie|bearer)", re.I)
+summary = {
+    "model": config.get("model"),
+    "fallback_providers": config.get("fallback_providers"),
+    "providers": {},
+    "gateway": config.get("gateway"),
+}
+for name, provider in (config.get("providers") or {}).items():
+    if not isinstance(provider, dict):
+        continue
+    summary["providers"][name] = {
+        k: ("<set>" if secret_re.search(str(k)) and v else "<empty>" if secret_re.search(str(k)) else v)
+        for k, v in provider.items()
+        if k in ("name", "api", "api_key", "base_url", "default_model", "api_mode")
+    }
+print(json.dumps(summary, ensure_ascii=False, indent=2))
+PY
+```
+
+官方 fallback 配置格式：
+
+```yaml
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4
+```
+
+custom/OpenAI-compatible fallback 也可以指定 endpoint：
+
+```yaml
+fallback_providers:
+  - provider: custom
+    model: my-local-model
+    base_url: http://localhost:8000/v1
+    key_env: MY_LOCAL_KEY
+```
+
+诊断判断：
+- `No fallback providers configured`：主模型一旦超时/限流/账号池不可用，用户会直接等待到失败
+- fallback 和主模型完全相同：只能重复失败路径，不算有效兜底
+- 推荐 fallback 使用不同 provider 或至少不同模型/账号池，例如主模型 `ca03openai/gpt-5.5`，fallback 用 `ca03gemini/gemini-2.5-flash`
+- `No LLM provider configured`：模型配置缺失，需要 `hermes model` 或 `hermes setup`
+- `No Codex credentials stored`、`not logged in`：OAuth 类 provider 需要目标机器交互式授权
+
+### Hermes 阶段 4：上游模型最小探针
+
+在不打印密钥的前提下，对配置中的 provider 做最小 `/models` 和 `/chat/completions` 探针。这个探针能区分 endpoint 不通、缺 API key、账号池不可用、模型请求超时和 Hermes 主流程问题。
+
+```bash
+python3 - <<'PY'
+import os, json, time, re, urllib.request, urllib.error
+try:
+    import yaml
+except Exception as e:
+    print("yaml_import_error", repr(e)); raise SystemExit
+
+cfg = yaml.safe_load(open(os.path.expanduser("~/.hermes/config.yaml"))) or {}
+model_cfg = cfg.get("model") or {}
+providers = cfg.get("providers") or {}
+targets = []
+
+primary_provider = model_cfg.get("provider")
+primary_model = model_cfg.get("default")
+if primary_provider and primary_provider in providers:
+    p = providers[primary_provider]
+    targets.append((primary_provider, p.get("api") or p.get("base_url"), p.get("api_key"), primary_model or p.get("default_model")))
+
+for fb in cfg.get("fallback_providers") or []:
+    if not isinstance(fb, dict):
+        continue
+    name = fb.get("provider")
+    p = providers.get(name, {}) if name else {}
+    base = fb.get("base_url") or p.get("api") or p.get("base_url")
+    key = p.get("api_key")
+    key_env = fb.get("key_env")
+    if key_env and os.environ.get(key_env):
+        key = os.environ[key_env]
+    targets.append((name or "custom", base, key, fb.get("model") or p.get("default_model")))
+
+seen = set()
+for name, base, key, model in targets:
+    ident = (name, base, model)
+    if ident in seen:
+        continue
+    seen.add(ident)
+    print(f"--- {name} / {model} ---")
+    print("base", base)
+    print("key", "set" if key else "missing")
+    if not base or not model:
+        print("skip: missing base/model")
+        continue
+    headers = {}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/models", headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            print("models", r.status, "time", round(time.time() - t0, 2))
+    except urllib.error.HTTPError as e:
+        print("models_http_error", e.code, "time", round(time.time() - t0, 2), e.read(300).decode("utf-8", "replace"))
+    except Exception as e:
+        print("models_exception", type(e).__name__, "time", round(time.time() - t0, 2), str(e)[:300])
+
+    payload = {"model": model, "messages": [{"role": "user", "content": "Reply with OK only."}], "max_tokens": 8, "stream": False}
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/chat/completions", data=json.dumps(payload).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=75) as r:
+            body = r.read(500).decode("utf-8", "replace")
+            print("chat", r.status, "time", round(time.time() - t0, 2), re.sub(r"sk-[A-Za-z0-9_-]+", "<redacted>", body))
+    except urllib.error.HTTPError as e:
+        body = e.read(500).decode("utf-8", "replace")
+        print("chat_http_error", e.code, "time", round(time.time() - t0, 2), re.sub(r"sk-[A-Za-z0-9_-]+", "<redacted>", body))
+    except Exception as e:
+        print("chat_exception", type(e).__name__, "time", round(time.time() - t0, 2), str(e)[:500])
+PY
+```
+
+如果裸 API 探针成功，再跑 Hermes 主流程最小调用：
+
+```bash
+hermes -z "只回复 OK 两个字，不要解释。" 2>&1 | tail -50
+```
+
+判断：
+- 裸 API 成功、`hermes -z` 失败：Hermes 主流程、skills/context、工具初始化或配置问题
+- 裸 API 失败、`hermes -z` 失败：provider/endpoint/账号池问题
+- 裸 API 成功、gateway 收发失败：消息平台问题
+
+### Hermes 阶段 5：Sessions、Cron、Skills、Tools、Memory
+
+官方恢复工具链包括 `hermes sessions list`、`hermes --continue`、`hermes gateway status`。诊断时采集：
+
+```bash
+echo "===SESSIONS==="
+hermes sessions list 2>&1 || true
+
+echo "===CRON==="
+hermes cron list 2>&1 || true
+
+echo "===SKILLS==="
+hermes skills list 2>&1 | head -120 || true
+
+echo "===LOGS_CMD==="
+hermes logs 2>&1 | tail -120 || true
+```
+
+检查项：
+- session 是否存在、是否异常膨胀、是否出现 request dump
+- cron job 是否启用、next_run 是否正常、失败是否来自模型/平台
+- `hermes doctor` 的 tool availability 中是否有关键工具缺依赖
+- Skills Hub 是否正常，相关 skill 是否已安装
+- memory provider 是否 active，`~/.hermes/memories/` 和 `~/.hermes/state.db` 是否存在
+
+### Hermes 常见错误模式
+
+| 错误模式 | 含义 | 严重程度 |
+|---------|------|---------|
+| `APITimeoutError` / `Request timed out` | 模型请求超时，可能是上游网关、账号池、网络或模型响应慢 | 高 |
+| `No available accounts` | 上游模型网关账号池无可用账号 | 高 |
+| `API_KEY_REQUIRED` / `401` | provider endpoint 可达但缺少或未使用 API key | 高 |
+| `No LLM provider configured` | Hermes 未配置模型/provider | 致命 |
+| `No fallback providers configured` | 主模型失败时没有自动兜底 | 中到高 |
+| `Unauthorized user` | 消息用户未配对/不在 allowlist | 中 |
+| `No messaging platforms enabled` | gateway 没启用任何消息平台 | 高 |
+| `rate limited` / `send failed` | 消息平台发送限流或失败，模型可能已生成但用户收不到 | 高 |
+| `Fallback send also failed` | 普通文本兜底发送也失败，用户侧通常表现为无回复 | 高 |
+| `not logged in` / `No Codex credentials stored` | OAuth provider 未授权或凭据缺失 | 中到高 |
+| `Playwright Chromium not installed` | browser 工具不可用，不影响纯聊天 | 低到中 |
+
+### Hermes 修复建议
+
+执行修复前必须告知用户将要修改什么。
+
+**重启 gateway：**
+```bash
+hermes gateway restart
+```
+
+macOS launchd 兜底：
+```bash
+launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway
+```
+
+**配置有效 fallback：**
+优先使用不同 provider 或不同模型，不要把 fallback 配成与主模型完全相同。
+
+```yaml
+fallback_providers:
+  - provider: ca03gemini
+    model: gemini-2.5-flash
+```
+
+配置后重启 gateway，并用上游模型最小探针确认 fallback 可用。
+
+**缺模型/provider：**
+需要目标机器交互式运行：
+```bash
+hermes model
+```
+或完整配置：
+```bash
+hermes setup
+```
+
+**配置过期或依赖缺失：**
+```bash
+hermes config check
+hermes config migrate
+hermes doctor --fix
+```
+
+**OAuth 授权缺失：**
+需要目标机器交互式授权：
+```bash
+hermes auth
+hermes auth add <provider>
+```
+
+**微信/平台限流：**
+通常不能靠重启根治。先等待平台冷却，减少连续多条回复、长消息拆分和并发发送；如果日志显示 `response ready` 后 `send failed`，模型侧不是根因。
 
 ## 自动修复
 
